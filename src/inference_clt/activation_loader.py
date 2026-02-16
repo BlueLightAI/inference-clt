@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import TYPE_CHECKING, Any, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Literal, Optional, Sequence
 
 import torch
 from torch import nn
@@ -53,10 +53,14 @@ class ActivationLoader:
         self.layer_indices = list(range(n_layers)) if layer_indices is None else list(layer_indices)
 
         self._parsed_attrs = [self._parse_attr(a) for a in per_layer_attrs]
-        self._cache: dict[int, dict[str, dict[str, torch.Tensor]]] = {
-            i: defaultdict(dict) for i in self.layer_indices
-        }
+        self._cache: dict[int, dict[int, dict[str, dict[str, torch.Tensor]]]] = {}
+        self._current_call_idx = -1
+
         self._hooks: list[Any] = []
+        self._model_pre_hook = self.model.register_forward_pre_hook(
+            self._on_model_pre_forward,
+            with_kwargs=True,
+        )
 
         for layer_idx in self.layer_indices:
             layer = layers[layer_idx]
@@ -67,14 +71,22 @@ class ActivationLoader:
 
                     def hook(_module, args, _output, layer_idx=layer_idx, component_attr=component_attr):
                         act = _extract_tensor(args)
-                        self._cache[layer_idx][component_attr]["input"] = self._convert_activation(act)
+                        converted = self._convert_activation(act)
+                        if self._current_call_idx >= 0 and self._current_call_idx in self._cache:
+                            self._cache[self._current_call_idx][layer_idx][component_attr][
+                                "input"
+                            ] = converted
 
                     self._hooks.append(component.register_forward_hook(hook))
                 elif port == "output":
 
                     def hook(_module, _args, output, layer_idx=layer_idx, component_attr=component_attr):
                         act = _extract_tensor(output)
-                        self._cache[layer_idx][component_attr]["output"] = self._convert_activation(act)
+                        converted = self._convert_activation(act)
+                        if self._current_call_idx >= 0 and self._current_call_idx in self._cache:
+                            self._cache[self._current_call_idx][layer_idx][component_attr][
+                                "output"
+                            ] = converted
 
                     self._hooks.append(component.register_forward_hook(hook))
                 else:
@@ -113,13 +125,24 @@ class ActivationLoader:
             out = out.reshape(-1, out.shape[-1])
         return out
 
-    def clear_cache(self) -> None:
-        self._cache = {i: defaultdict(dict) for i in self.layer_indices}
+    def _new_layer_cache(self) -> dict[int, dict[str, dict[str, torch.Tensor]]]:
+        return {i: defaultdict(dict) for i in self.layer_indices}
+
+    def _on_model_pre_forward(self, _module, _args, kwargs) -> None:
+        self._current_call_idx += 1
+        self._cache[self._current_call_idx] = self._new_layer_cache()
+
+    def _reset_cache(self) -> None:
+        self._cache = {}
+        self._current_call_idx = -1
 
     def remove_hooks(self) -> None:
         for hook in self._hooks:
             hook.remove()
         self._hooks.clear()
+        if self._model_pre_hook is not None:
+            self._model_pre_hook.remove()
+            self._model_pre_hook = None
 
     def close(self) -> None:
         self.remove_hooks()
@@ -130,22 +153,102 @@ class ActivationLoader:
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
 
-    def run(self, **model_inputs) -> tuple[torch.Tensor, ...]:
-        """Run the model and retrieve activations from the hooked points.
-        
-        Returns a tuple of tensors of shape (n_layers, ...), one tensor for each
-        hook point in self.per_layer_attrs.
-        """
-        with torch.inference_mode():
-            self.model(**model_inputs)
-
+    def _assemble_single_call_capture(
+        self,
+        call_cache: dict[int, dict[str, dict[str, torch.Tensor]]],
+    ) -> tuple[torch.Tensor, ...]:
         saved_acts: list[torch.Tensor] = []
         for component_attr, port in self._parsed_attrs:
-            per_layer = [self._cache[i][component_attr][port] for i in self.layer_indices]
+            per_layer = [call_cache[i][component_attr][port] for i in self.layer_indices]
             saved_acts.append(torch.stack(per_layer, dim=0))
-
-        self.clear_cache()
         return tuple(saved_acts)
 
+    def run(
+        self,
+        return_model_output: bool = False,
+        **model_inputs: Any,
+    ) -> tuple[torch.Tensor, ...] | tuple[tuple[torch.Tensor, ...], Any]:
+        """Run the model and retrieve activations from the hooked points.
 
-TorchActivationWrapper = ActivationLoader
+        Args:
+            return_model_output: If True, also return the model forward output.
+            **model_inputs: Inputs forwarded to `model(**model_inputs)`.
+
+        Returns a tuple of tensors of shape (n_layers, ...), one tensor for each
+        hook point in self.per_layer_attrs.
+
+        If `return_model_output=True`, returns `(model_output, activations)`.
+        """
+        self._reset_cache()
+        with torch.inference_mode():
+            start_call_idx = self._current_call_idx
+            model_output = self.model(**model_inputs)
+
+            call_ids = sorted(call_id for call_id in self._cache.keys() if call_id > start_call_idx)
+        if not call_ids:
+            raise RuntimeError("No activations were captured during run()")
+        saved_acts = list(self._assemble_single_call_capture(self._cache[call_ids[-1]]))
+
+        self._reset_cache()
+        activations = tuple(saved_acts)
+        if return_model_output:
+            return model_output, activations
+        return activations
+
+    def generate_with_activations(
+        self,
+        generation_kwargs: dict[str, Any] | None = None,
+        capture_mode: Literal["all", "prefill_only", "decode_only"] = "all",
+        **model_inputs: Any,
+    ) -> tuple[Any, dict[str, Any]]:
+        """Run model.generate() and capture activations from prefill and decode passes.
+
+        Args:
+            generation_kwargs: Optional kwargs passed through to `model.generate(...)`.
+            capture_mode: One of {"all", "prefill_only", "decode_only"}.
+            **model_inputs: Inputs forwarded to `model.generate(...)`.
+
+        Returns:
+            A tuple `(generation_output, captures)` where `captures` has keys:
+            - `prefill`: tuple[Tensor, ...] | None
+            - `decode_steps`: list[tuple[Tensor, ...]]
+        """
+        if not hasattr(self.model, "generate"):
+            raise ValueError("Model does not expose generate(); use a generation-capable HF model")
+
+        if capture_mode not in {"all", "prefill_only", "decode_only"}:
+            raise ValueError(
+                "capture_mode must be one of {'all', 'prefill_only', 'decode_only'}"
+            )
+
+        generation_kwargs = dict(generation_kwargs or {})
+
+        self._reset_cache()
+
+        with torch.inference_mode():
+            start_call_idx = self._current_call_idx
+            generation_output = self.model.generate(**model_inputs, **generation_kwargs)
+
+            call_ids = sorted(call_id for call_id in self._cache.keys() if call_id > start_call_idx)
+        if not call_ids:
+            self._reset_cache()
+            captures = {"prefill": None, "decode_steps": []}
+            return generation_output, captures
+
+        prefill_call_id = call_ids[0]
+        prefill_capture = self._assemble_single_call_capture(self._cache[prefill_call_id])
+        decode_steps: list[tuple[torch.Tensor, ...]] = []
+
+        for call_id in call_ids[1:]:
+            decode_steps.append(self._assemble_single_call_capture(self._cache[call_id]))
+
+        if capture_mode == "prefill_only":
+            captures = {"prefill": prefill_capture, "decode_steps": []}
+        elif capture_mode == "decode_only":
+            captures = {"prefill": None, "decode_steps": decode_steps}
+        else:
+            captures = {"prefill": prefill_capture, "decode_steps": decode_steps}
+
+        self._reset_cache()
+
+        return generation_output, captures
