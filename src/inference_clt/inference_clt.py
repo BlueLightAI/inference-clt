@@ -198,8 +198,8 @@ def _load_circuit_tracer_checkpoint(
         "k": 0,
         "decoder_layout": "input_layer",
         "base_model_name": cfg_yaml.get("model_name"),
-        "input_attr": cfg_yaml.get("feature_input_hook"),
-        "output_attr": cfg_yaml.get("feature_output_hook"),
+        "input_attr": cfg_yaml.get("feature_input_hook", "mlp.input").replace("hook_in", "input"),
+        "output_attr": cfg_yaml.get("feature_output_hook", "mlp.output").replace("hook_out", "output"),
     }
 
     return config_dict, state_dict
