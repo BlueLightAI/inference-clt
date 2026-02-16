@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Sequence
 
 import torch
 from huggingface_hub import snapshot_download
+from safetensors import safe_open
 from safetensors.torch import load_file
 from torch import nn
 
@@ -55,11 +56,17 @@ def _saved_key_to_state_dict_key(
 
 
 def _load_state_dict_from_checkpoint(
-    path: Path, device: str | torch.device
+    path: Path, device: str | torch.device, encoder_only: bool = False
 ) -> dict[str, torch.Tensor]:
     manifest_path = path / "manifest.json"
     if not manifest_path.exists():
-        return load_file(path / "clt.safetensors", device=str(device))
+        state_dict: dict[str, torch.Tensor] = {}
+        with safe_open(path / "clt.safetensors", framework="pt", device=str(device)) as f:
+            for key in f.keys():
+                if encoder_only and key.startswith("decoder."):
+                    continue
+                state_dict[key] = f.get_tensor(key)
+        return state_dict
 
     with open(manifest_path, "r") as f:
         manifest = json.load(f)
@@ -87,6 +94,8 @@ def _load_state_dict_from_checkpoint(
                 decoder_type,
                 layer_index_map,
             )
+            if encoder_only and mapped_key.startswith("decoder."):
+                continue
             state_dict[mapped_key] = value
 
     return state_dict
@@ -106,18 +115,25 @@ def _detect_checkpoint_format(path: Path) -> Literal["clt", "circuit_tracer"]:
 def _load_circuit_tracer_checkpoint(
     path: Path,
     device: str | torch.device,
+    encoder_only: bool = False,
 ) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
     enc_files = sorted(path.glob("W_enc_*.safetensors"), key=lambda p: int(p.stem.split("_")[-1]))
     dec_files = sorted(path.glob("W_dec_*.safetensors"), key=lambda p: int(p.stem.split("_")[-1]))
 
-    if not enc_files or not dec_files:
+    if not enc_files:
         raise FileNotFoundError(
             f"Missing circuit-tracer weight files in {path}. "
-            "Expected W_enc_*.safetensors and W_dec_*.safetensors."
+            "Expected W_enc_*.safetensors."
+        )
+
+    if not encoder_only and not dec_files:
+        raise FileNotFoundError(
+            f"Missing circuit-tracer decoder weight files in {path}. "
+            "Expected W_dec_*.safetensors."
         )
 
     n_layers = len(enc_files)
-    if len(dec_files) != n_layers:
+    if not encoder_only and len(dec_files) != n_layers:
         raise ValueError(
             f"Expected {n_layers} decoder files, found {len(dec_files)}"
         )
@@ -135,12 +151,15 @@ def _load_circuit_tracer_checkpoint(
         b_dec_key = f"b_dec_{layer_idx}"
         threshold_key = f"threshold_{layer_idx}"
 
-        if W_enc_key not in layer_data or b_enc_key not in layer_data or b_dec_key not in layer_data:
+        if W_enc_key not in layer_data or b_enc_key not in layer_data:
+            raise ValueError(f"Malformed encoder file {enc_file.name}")
+        if not encoder_only and b_dec_key not in layer_data:
             raise ValueError(f"Malformed encoder file {enc_file.name}")
 
         W_enc_layers.append(layer_data[W_enc_key].transpose(0, 1).contiguous())
         b_enc_layers.append(layer_data[b_enc_key])
-        b_dec_layers.append(layer_data[b_dec_key])
+        if not encoder_only:
+            b_dec_layers.append(layer_data[b_dec_key])
 
         if threshold_key in layer_data:
             thresholds.append(layer_data[threshold_key])
@@ -149,7 +168,7 @@ def _load_circuit_tracer_checkpoint(
 
     W_enc = torch.stack(W_enc_layers, dim=0)
     b_enc = torch.stack(b_enc_layers, dim=0)
-    b_dec = torch.stack(b_dec_layers, dim=0)
+    b_dec = torch.stack(b_dec_layers, dim=0) if not encoder_only else None
 
     d_in = int(W_enc.shape[1])
     d_latent = int(W_enc.shape[2])
@@ -157,21 +176,29 @@ def _load_circuit_tracer_checkpoint(
     state_dict: dict[str, torch.Tensor] = {
         "encoder.W": W_enc,
         "encoder.b": b_enc,
-        "decoder.b": b_dec,
         "norm_factor_in": torch.ones(n_layers, 1, 1, device=W_enc.device, dtype=W_enc.dtype),
-        "norm_factor_out": torch.ones(n_layers, 1, 1, device=W_enc.device, dtype=W_enc.dtype),
     }
+    if not encoder_only:
+        state_dict["decoder.b"] = b_dec
+        state_dict["norm_factor_out"] = torch.ones(
+            n_layers,
+            1,
+            1,
+            device=W_enc.device,
+            dtype=W_enc.dtype,
+        )
 
-    for layer_idx, dec_file in enumerate(dec_files):
-        layer_data = load_file(dec_file, device=str(device))
-        W_dec_key = f"W_dec_{layer_idx}"
-        if W_dec_key not in layer_data:
-            raise ValueError(f"Malformed decoder file {dec_file.name}")
-        W_dec = layer_data[W_dec_key]
-        if W_dec.shape[0] != d_latent:
-            raise ValueError(f"Decoder latent mismatch in {dec_file.name}")
-        # circuit-tracer saves (d_latent, n_layers-i, d_in); CLT input-layer expects (n_layers-i, d_latent, d_in)
-        state_dict[f"decoder.decoders.{layer_idx}.W"] = W_dec.permute(1, 0, 2).contiguous()
+    if not encoder_only:
+        for layer_idx, dec_file in enumerate(dec_files):
+            layer_data = load_file(dec_file, device=str(device))
+            W_dec_key = f"W_dec_{layer_idx}"
+            if W_dec_key not in layer_data:
+                raise ValueError(f"Malformed decoder file {dec_file.name}")
+            W_dec = layer_data[W_dec_key]
+            if W_dec.shape[0] != d_latent:
+                raise ValueError(f"Decoder latent mismatch in {dec_file.name}")
+            # circuit-tracer saves (d_latent, n_layers-i, d_in); CLT input-layer expects (n_layers-i, d_latent, d_in)
+            state_dict[f"decoder.decoders.{layer_idx}.W"] = W_dec.permute(1, 0, 2).contiguous()
 
     if has_threshold:
         threshold = torch.stack(thresholds, dim=0).clamp_min(1e-12)
@@ -214,12 +241,18 @@ class InferenceCLT(nn.Module):
     - decoding feature values to reconstructed activations
     """
 
-    def __init__(self, config_dict: dict[str, Any], state_dict: dict[str, torch.Tensor]):
+    def __init__(
+        self,
+        config_dict: dict[str, Any],
+        state_dict: dict[str, torch.Tensor],
+        encoder_only: bool = False,
+    ):
         super().__init__()
         self.raw_config = config_dict
+        self.encoder_only = encoder_only
 
         self.threshold: nn.Parameter | None = None
-        self.decoder_bias: nn.Parameter
+        self.decoder_bias: nn.Parameter | None = None
         self.decoder_weights = nn.ParameterList()
 
         config_version = int(config_dict.get("config_version", 1))
@@ -239,17 +272,21 @@ class InferenceCLT(nn.Module):
         self.W_enc = nn.Parameter(state_dict["encoder.W"], requires_grad=False)
         self.b_enc = nn.Parameter(state_dict["encoder.b"], requires_grad=False)
 
-        if "norm_factor_in" not in state_dict or "norm_factor_out" not in state_dict:
+        if "norm_factor_in" not in state_dict:
             raise ValueError("Saved weights are missing normalization factors")
 
         self.norm_factor_in = nn.Parameter(
             state_dict["norm_factor_in"].reshape((-1, 1, 1)),
             requires_grad=False,
         )
-        self.norm_factor_out = nn.Parameter(
-            state_dict["norm_factor_out"].reshape((-1, 1, 1)),
-            requires_grad=False,
-        )
+        self.norm_factor_out: nn.Parameter | None = None
+        if not self.encoder_only:
+            if "norm_factor_out" not in state_dict:
+                raise ValueError("Saved weights are missing output normalization factors")
+            self.norm_factor_out = nn.Parameter(
+                state_dict["norm_factor_out"].reshape((-1, 1, 1)),
+                requires_grad=False,
+            )
 
         if self.activation_type == "jumprelu":
             if "activation.log_threshold" not in state_dict:
@@ -259,7 +296,8 @@ class InferenceCLT(nn.Module):
                 requires_grad=False,
             )
 
-        self._load_decoder_weights(state_dict)
+        if not self.encoder_only:
+            self._load_decoder_weights(state_dict)
 
     def _init_from_v2_config(self, config_dict: dict[str, Any]) -> None:
         base = config_dict["base_model"]
@@ -355,16 +393,23 @@ class InferenceCLT(nn.Module):
             "d_latent": self.d_latent,
             "activation": self.activation_type,
             "decoder_layout": self.decoder_layout,
+            "encoder_only": self.encoder_only,
         }
 
-    def _apply_activation(self, pre_activations: torch.Tensor) -> torch.Tensor:
+    def _apply_activation(
+        self,
+        pre_activations: torch.Tensor,
+        threshold: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if self.activation_type == "relu":
             return pre_activations.relu()
 
         if self.activation_type == "jumprelu":
-            if self.threshold is None:
+            if threshold is None:
+                threshold = self.threshold
+            if threshold is None:
                 raise ValueError("JumpReLU model missing threshold")
-            threshold = self.threshold.unsqueeze(1).to(pre_activations.dtype)
+            threshold = threshold.unsqueeze(1).to(pre_activations.dtype)
             return pre_activations * (pre_activations > threshold)
 
         if self.activation_type == "topk":
@@ -378,11 +423,73 @@ class InferenceCLT(nn.Module):
 
         raise ValueError(f"Unsupported activation type: {self.activation_type}")
 
-    def encode(self, input_activations: torch.Tensor) -> torch.Tensor:
+    def encode(
+        self,
+        input_activations: torch.Tensor,
+        layer_indices: Sequence[int] | None = None,
+    ) -> torch.Tensor:
         """Map input activations (n_layers, batch, d_in) to feature activations."""
-        normalized = input_activations / self.norm_factor_in
-        pre = torch.bmm(normalized, self.W_enc) + self.b_enc.unsqueeze(1).to(normalized.dtype)
-        return self._apply_activation(pre)
+        if layer_indices is None:
+            norm_factor_in = self.norm_factor_in
+            W_enc = self.W_enc
+            b_enc = self.b_enc
+            threshold = self.threshold
+            expected_layers = self.n_training_layers
+        else:
+            selected = list(layer_indices)
+            if input_activations.shape[0] != len(selected):
+                raise ValueError(
+                    "input_activations first dim must match len(layer_indices) "
+                    f"({len(selected)}), got {input_activations.shape[0]}"
+                )
+            if not selected:
+                raise ValueError("layer_indices must not be empty")
+
+            if self.layer_indices is None:
+                max_idx = self.n_training_layers - 1
+                local_selected: list[int] = []
+                for layer_idx in selected:
+                    if layer_idx < 0 or layer_idx > max_idx:
+                        raise ValueError(
+                            f"layer index {layer_idx} out of range [0, {max_idx}]"
+                        )
+                    local_selected.append(layer_idx)
+            else:
+                layer_to_local_idx = {
+                    base_layer_idx: local_idx
+                    for local_idx, base_layer_idx in enumerate(self.layer_indices)
+                }
+                local_selected = []
+                for layer_idx in selected:
+                    if layer_idx not in layer_to_local_idx:
+                        raise ValueError(
+                            f"layer index {layer_idx} not found in loaded layer_indices {self.layer_indices}"
+                        )
+                    local_selected.append(layer_to_local_idx[layer_idx])
+
+            index_tensor = torch.tensor(
+                local_selected,
+                device=self.W_enc.device,
+                dtype=torch.long,
+            )
+            norm_factor_in = self.norm_factor_in.index_select(0, index_tensor)
+            W_enc = self.W_enc.index_select(0, index_tensor)
+            b_enc = self.b_enc.index_select(0, index_tensor)
+            threshold = (
+                self.threshold.index_select(0, index_tensor)
+                if self.threshold is not None
+                else None
+            )
+            expected_layers = len(selected)
+
+        if input_activations.shape[0] != expected_layers:
+            raise ValueError(
+                f"Expected input_activations first dim {expected_layers}, got {input_activations.shape[0]}"
+            )
+
+        normalized = input_activations / norm_factor_in
+        pre = torch.bmm(normalized, W_enc) + b_enc.unsqueeze(1).to(normalized.dtype)
+        return self._apply_activation(pre, threshold=threshold)
 
     def _decode_input_layer(self, features: torch.Tensor) -> torch.Tensor:
         if len(self.decoder_weights) != self.n_training_layers:
@@ -398,16 +505,22 @@ class InferenceCLT(nn.Module):
 
     def decode(self, features: torch.Tensor) -> torch.Tensor:
         """Map feature activations (n_layers, batch, d_latent) to output activations."""
+        if self.encoder_only:
+            raise RuntimeError("decode() is unavailable for encoder-only InferenceCLT")
         if features.shape[0] != self.n_training_layers:
             raise ValueError(
                 f"Expected features with first dim {self.n_training_layers}, got {features.shape[0]}"
             )
         decoded = self._decode_input_layer(features)
+        if self.norm_factor_out is None:
+            raise RuntimeError("decode() is unavailable: output normalization is missing")
 
         return decoded * self.norm_factor_out
 
     def reconstruct(self, input_activations: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Return (features, reconstructed_outputs) from input activations."""
+        if self.encoder_only:
+            raise RuntimeError("reconstruct() is unavailable for encoder-only InferenceCLT")
         features = self.encode(input_activations)
         reconstructed = self.decode(features)
         return features, reconstructed
@@ -418,6 +531,7 @@ class InferenceCLT(nn.Module):
         path: str | Path,
         device: str | torch.device = "cpu",
         dtype: torch.dtype | None = None,
+        encoder_only: bool = False,
     ) -> "InferenceCLT":
         path = Path(path)
 
@@ -426,12 +540,24 @@ class InferenceCLT(nn.Module):
             with open(path / "model_config.json", "r") as f:
                 config_dict = json.load(f)
             saved_dtype = _STR_TO_DTYPE[config_dict.get("dtype", "float32")]
-            state_dict = _load_state_dict_from_checkpoint(path, device=device)
+            state_dict = _load_state_dict_from_checkpoint(
+                path,
+                device=device,
+                encoder_only=encoder_only,
+            )
         else:
-            config_dict, state_dict = _load_circuit_tracer_checkpoint(path, device=device)
+            config_dict, state_dict = _load_circuit_tracer_checkpoint(
+                path,
+                device=device,
+                encoder_only=encoder_only,
+            )
             saved_dtype = next(iter(state_dict.values())).dtype
 
-        model = cls(config_dict=config_dict, state_dict=state_dict)
+        model = cls(
+            config_dict=config_dict,
+            state_dict=state_dict,
+            encoder_only=encoder_only,
+        )
         model = model.to(device=device, dtype=dtype or saved_dtype)
         model.eval()
         return model
@@ -445,6 +571,7 @@ class InferenceCLT(nn.Module):
         device: str | torch.device = "cpu",
         dtype: torch.dtype | None = None,
         token: str | None = None,
+        encoder_only: bool = False,
     ) -> "InferenceCLT":
         """Load an InferenceCLT directly from a Hugging Face model repository.
 
@@ -455,6 +582,7 @@ class InferenceCLT(nn.Module):
             device: Device to place tensors on after loading
             dtype: Optional dtype override for loaded tensors
             token: Optional HF auth token
+            encoder_only: If True, load only encoder-side parameters and disable decode/reconstruct
 
         Returns:
             InferenceCLT loaded from checkpoint files in the repository
@@ -474,4 +602,9 @@ class InferenceCLT(nn.Module):
                 f"repo_subpath '{repo_subpath}' does not exist in downloaded snapshot for {repo_id}"
             )
 
-        return cls.load_from_disk(checkpoint_root, device=device, dtype=dtype)
+        return cls.load_from_disk(
+            checkpoint_root,
+            device=device,
+            dtype=dtype,
+            encoder_only=encoder_only,
+        )

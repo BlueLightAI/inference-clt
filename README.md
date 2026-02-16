@@ -94,6 +94,34 @@ model = InferenceCLT.load_from_huggingface(
 )
 ```
 
+## Optional memory-saving and partial-encode modes
+
+### Encoder-only loading
+
+If you only need features (not reconstruction), you can skip loading decoder weights:
+
+```python
+clt = InferenceCLT.load_from_disk(
+    "/path/to/model_dir",
+    device="cuda:0",
+    encoder_only=True,
+)
+
+features = clt.encode(mlp_in)
+# clt.decode(...) and clt.reconstruct(...) will raise RuntimeError
+```
+
+### Runtime encoder layer subset
+
+You can encode only a subset of CLT layers by passing `layer_indices` to `encode()`.
+When you do this, `input_activations` must contain only those layers in the same order:
+
+```python
+subset = [0, 2, 5]
+subset_acts = mlp_in[subset]                  # shape: (len(subset), tokens, d_in)
+subset_features = clt.encode(subset_acts, layer_indices=subset)
+```
+
 ## Tensor shapes
 
 This package uses layer-first tensors:
