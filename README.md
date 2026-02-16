@@ -94,11 +94,10 @@ model = InferenceCLT.load_from_huggingface(
 )
 ```
 
-## Optional memory-saving and partial-encode modes
+## Encoder-only loading
 
-### Encoder-only loading
-
-If you only need features (not reconstruction), you can skip loading decoder weights:
+If you only need features (not reconstruction), you can skip loading decoder
+weights. This can be a substantial memory savings:
 
 ```python
 clt = InferenceCLT.load_from_disk(
@@ -111,7 +110,7 @@ features = clt.encode(mlp_in)
 # clt.decode(...) and clt.reconstruct(...) will raise RuntimeError
 ```
 
-### Runtime encoder layer subset
+## Runtime encoder layer subset
 
 You can encode only a subset of CLT layers by passing `layer_indices` to `encode()`.
 When you do this, `input_activations` must contain only those layers in the same order:
