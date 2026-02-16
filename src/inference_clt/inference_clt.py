@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import torch
+from huggingface_hub import snapshot_download
 from safetensors.torch import load_file
 from torch import nn
 
@@ -332,7 +333,12 @@ class InferenceCLT(nn.Module):
             )
         else:
             self.decoder_bias = nn.Parameter(
-                torch.zeros((n_layers, self.d_out), dtype=out_W.dtype), requires_grad=False,
+                torch.zeros(
+                    (n_layers, self.d_out),
+                    dtype=self.W_enc.dtype,
+                    device=self.W_enc.device,
+                ),
+                requires_grad=False,
             )
 
     @property
@@ -429,3 +435,43 @@ class InferenceCLT(nn.Module):
         model = model.to(device=device, dtype=dtype or saved_dtype)
         model.eval()
         return model
+
+    @classmethod
+    def load_from_huggingface(
+        cls,
+        repo_id: str,
+        repo_subpath: str | None = None,
+        revision: str | None = None,
+        device: str | torch.device = "cpu",
+        dtype: torch.dtype | None = None,
+        token: str | None = None,
+    ) -> "InferenceCLT":
+        """Load an InferenceCLT directly from a Hugging Face model repository.
+
+        Args:
+            repo_id: Hugging Face repository id, e.g. "org/model-name"
+            repo_subpath: Optional relative subdirectory inside repository where model files live
+            revision: Optional git revision / branch / tag
+            device: Device to place tensors on after loading
+            dtype: Optional dtype override for loaded tensors
+            token: Optional HF auth token
+
+        Returns:
+            InferenceCLT loaded from checkpoint files in the repository
+        """
+        snapshot_path = Path(
+            snapshot_download(
+                repo_id=repo_id,
+                repo_type="model",
+                revision=revision,
+                token=token,
+            )
+        )
+
+        checkpoint_root = snapshot_path / repo_subpath if repo_subpath else snapshot_path
+        if not checkpoint_root.exists():
+            raise FileNotFoundError(
+                f"repo_subpath '{repo_subpath}' does not exist in downloaded snapshot for {repo_id}"
+            )
+
+        return cls.load_from_disk(checkpoint_root, device=device, dtype=dtype)
