@@ -55,6 +55,7 @@ class ActivationLoader:
         self._parsed_attrs = [self._parse_attr(a) for a in per_layer_attrs]
         self._cache: dict[int, dict[int, dict[str, dict[str, torch.Tensor]]]] = {}
         self._current_call_idx = -1
+        self._capture_active = False
 
         self._hooks: list[Any] = []
         self._model_pre_hook = self.model.register_forward_pre_hook(
@@ -70,6 +71,8 @@ class ActivationLoader:
                 if port == "input":
 
                     def hook(_module, args, _output, layer_idx=layer_idx, component_attr=component_attr):
+                        if not self._capture_active:
+                            return
                         act = _extract_tensor(args)
                         converted = self._convert_activation(act)
                         if self._current_call_idx >= 0 and self._current_call_idx in self._cache:
@@ -81,6 +84,8 @@ class ActivationLoader:
                 elif port == "output":
 
                     def hook(_module, _args, output, layer_idx=layer_idx, component_attr=component_attr):
+                        if not self._capture_active:
+                            return
                         act = _extract_tensor(output)
                         converted = self._convert_activation(act)
                         if self._current_call_idx >= 0 and self._current_call_idx in self._cache:
@@ -129,6 +134,8 @@ class ActivationLoader:
         return {i: defaultdict(dict) for i in self.layer_indices}
 
     def _on_model_pre_forward(self, _module, _args, kwargs) -> None:
+        if not self._capture_active:
+            return
         self._current_call_idx += 1
         self._cache[self._current_call_idx] = self._new_layer_cache()
 
@@ -180,11 +187,14 @@ class ActivationLoader:
         If `return_model_output=True`, returns `(model_output, activations)`.
         """
         self._reset_cache()
-        with torch.inference_mode():
-            start_call_idx = self._current_call_idx
-            model_output = self.model(**model_inputs)
+        self._capture_active = True
+        try:
+            with torch.inference_mode():
+                model_output = self.model(**model_inputs)
+        finally:
+            self._capture_active = False
 
-            call_ids = sorted(call_id for call_id in self._cache.keys() if call_id > start_call_idx)
+        call_ids = sorted(self._cache.keys())
         if not call_ids:
             raise RuntimeError("No activations were captured during run()")
         saved_acts = list(self._assemble_single_call_capture(self._cache[call_ids[-1]]))
@@ -224,12 +234,14 @@ class ActivationLoader:
         generation_kwargs = dict(generation_kwargs or {})
 
         self._reset_cache()
+        self._capture_active = True
+        try:
+            with torch.inference_mode():
+                generation_output = self.model.generate(**model_inputs, **generation_kwargs)
+        finally:
+            self._capture_active = False
 
-        with torch.inference_mode():
-            start_call_idx = self._current_call_idx
-            generation_output = self.model.generate(**model_inputs, **generation_kwargs)
-
-            call_ids = sorted(call_id for call_id in self._cache.keys() if call_id > start_call_idx)
+        call_ids = sorted(self._cache.keys())
         if not call_ids:
             self._reset_cache()
             captures = {"prefill": None, "decode_steps": []}
