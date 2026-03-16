@@ -33,7 +33,7 @@ from inference_clt import ActivationLoader, InferenceCLT
 clt = InferenceCLT.load_from_disk("/path/to/checkpoint", device="cpu")
 
 # Load the base model
-model = AutoModel.from_pretrained(clt.base_model_name)
+model = AutoModel.from_pretrained(clt.base_model_name, torch_dtype="bfloat16")
 tokenizer = AutoTokenizer.from_pretrained(clt.base_model_name)
 
 # Create an activation loader
